@@ -1,0 +1,65 @@
+[
+  {
+    "id": "loc",
+    "name": "Library of Congress",
+    "url": "https://lx2.loc.gov/sru/lcdb",
+    "version": "1.1",
+    "default_schema": "dc",
+    "default_index": "dc",
+    "notes": "US national catalog"
+  },
+  {
+    "id": "loc-names",
+    "name": "LC Name Authority",
+    "url": "https://lx2.loc.gov/sru/naf",
+    "version": "1.1",
+    "default_schema": "dc",
+    "default_index": "dc",
+    "notes": "Personal and corporate names"
+  },
+  {
+    "id": "loc-subjects",
+    "name": "LC Subject Authority",
+    "url": "https://lx2.loc.gov/sru/saf",
+    "version": "1.1",
+    "default_schema": "dc",
+    "default_index": "dc",
+    "notes": "Subject headings and genre terms"
+  },
+  {
+    "id": "bnf",
+    "name": "Bibliothèque nationale de France",
+    "url": "http://catalogue.bnf.fr/api/SRU",
+    "version": "1.2",
+    "default_schema": "dublincore",
+    "default_index": "bib",
+    "notes": "French national library"
+  },
+  {
+    "id": "dnb",
+    "name": "Deutsche Nationalbibliothek",
+    "url": "http://services.dnb.de/sru/dnb",
+    "version": "1.1",
+    "default_schema": "oai_dc",
+    "default_index": "dc",
+    "notes": "German national library"
+  },
+  {
+    "id": "kb",
+    "name": "Koninklijke Bibliotheek",
+    "url": "http://jsru.kb.nl/sru",
+    "version": "1.1",
+    "default_schema": "dc",
+    "default_index": "dc",
+    "notes": "Netherlands national library"
+  },
+  {
+    "id": "bibsys",
+    "name": "BIBSYS",
+    "url": "http://sru.bibsys.no/search/biblio",
+    "version": "1.1",
+    "default_schema": "dc",
+    "default_index": "dc",
+    "notes": "Norwegian academic libraries"
+  }
+]
