@@ -709,3 +709,373 @@ class TestFormatSearchResultsMarkdown:
         md = sru.format_search_results_markdown(results)
         assert "Minimal" in md
         assert "Author" not in md
+
+
+# =====================================================================
+# Regression tests for the namespace-agnostic / list-safe explain parser
+# (the live "Unknown / 0 indexes" failure: real servers vary in how they
+# namespace the explain payload, and force_list wraps a lone <record>.)
+# =====================================================================
+
+# Explain payload whose elements all carry a namespace PREFIX (ns1:),
+# as some real SRU servers emit. Bare-name lookups miss these.
+EXPLAIN_XML_PREFIXED = """\
+<?xml version="1.0"?>
+<zs:explainResponse xmlns:zs="http://www.loc.gov/zing/srw/">
+  <zs:version>1.2</zs:version>
+  <zs:record>
+    <zs:recordSchema>http://explain.z3950.org/dtd/2.0/</zs:recordSchema>
+    <zs:recordData>
+      <ns1:explain xmlns:ns1="http://explain.z3950.org/dtd/2.0/">
+        <ns1:databaseInfo><ns1:title>Pitt Alma</ns1:title></ns1:databaseInfo>
+        <ns1:indexInfo>
+          <ns1:set identifier="info:srw/cql-context-set/1/alma" name="alma"/>
+          <ns1:index id="title" sort="true"><ns1:title>Title</ns1:title>
+            <ns1:map><ns1:name set="alma">title</ns1:name></ns1:map></ns1:index>
+          <ns1:index id="creator"><ns1:title>Author</ns1:title>
+            <ns1:map><ns1:name set="alma">creator</ns1:name></ns1:map></ns1:index>
+        </ns1:indexInfo>
+        <ns1:schemaInfo>
+          <ns1:schema identifier="http://www.loc.gov/MARC21/slim" name="marcxml">
+            <ns1:title>MARCXML</ns1:title></ns1:schema>
+        </ns1:schemaInfo>
+      </ns1:explain>
+    </zs:recordData>
+  </zs:record>
+</zs:explainResponse>
+"""
+
+# Explain payload where the SRW namespace is the DEFAULT (no zs: prefix),
+# so xmltodict keys the envelope as bare 'record'/'recordData' -- and
+# force_list=("record",) wraps it in a list, which broke _first.
+EXPLAIN_XML_DEFAULT_NS = """\
+<?xml version="1.0"?>
+<explainResponse xmlns="http://www.loc.gov/zing/srw/">
+  <version>1.2</version>
+  <record>
+    <recordData>
+      <explain xmlns="http://explain.z3950.org/dtd/2.0/">
+        <databaseInfo><title>DNB</title></databaseInfo>
+        <indexInfo>
+          <set identifier="x" name="dc"/>
+          <index><title>Title</title><map><name set="dc">title</name></map></index>
+        </indexInfo>
+      </explain>
+    </recordData>
+  </record>
+</explainResponse>
+"""
+
+
+class TestExplainNamespaceVariants:
+    @pytest.mark.asyncio
+    async def test_explain_with_prefixed_payload(self, mock_sru_server):
+        mock_sru_server.get("http://test.example/sru").mock(
+            return_value=httpx.Response(200, text=EXPLAIN_XML_PREFIXED,
+                                        headers={"content-type": "text/xml"})
+        )
+        root = await sru.explain("http://test.example/sru")
+        info = sru.parse_explain(root)
+        assert info["title"] == "Pitt Alma"
+        assert len(info["indexes"]) == 2
+        assert info["indexes"][0]["name"] == "title"
+        assert info["indexes"][0]["set"] == "alma"
+        assert info["indexes"][0]["sort"] is True
+        assert info["indexes"][1]["sort"] is False
+        assert len(info["schemas"]) == 1
+        assert info["schemas"][0]["name"] == "marcxml"
+
+    @pytest.mark.asyncio
+    async def test_explain_with_default_namespace(self, mock_sru_server):
+        mock_sru_server.get("http://test.example/sru").mock(
+            return_value=httpx.Response(200, text=EXPLAIN_XML_DEFAULT_NS,
+                                        headers={"content-type": "text/xml"})
+        )
+        root = await sru.explain("http://test.example/sru")
+        info = sru.parse_explain(root)
+        assert info["title"] == "DNB"
+        assert len(info["indexes"]) == 1
+        assert info["indexes"][0]["name"] == "title"
+
+
+class TestFirstIsListSafe:
+    def test_first_returns_none_on_list(self):
+        # Regression: _first must not do a membership test against a list.
+        assert sru._first(["a", "b"], "a") is None
+
+    def test_unwrap_single_element_list(self):
+        assert sru._unwrap([{"x": 1}]) == {"x": 1}
+        assert sru._unwrap([1, 2]) == [1, 2]
+        assert sru._unwrap({"x": 1}) == {"x": 1}
+
+    def test_get_ns_matches_localname(self):
+        d = {"zs:record": 1, "ns1:databaseInfo": 2}
+        assert sru._get_ns(d, "record") == 1
+        assert sru._get_ns(d, "databaseInfo") == 2
+        assert sru._get_ns(d, "missing") is None
+        assert sru._get_ns(["not", "a", "dict"], "record") is None
+
+
+class TestBuildCQLSort:
+    def test_alma_appends_default_relevance_sort(self):
+        assert (sru.build_cql(index_set="alma", keyword="whale")
+                == 'alma.all_for_ui = whale sortBy alma.rank/sort.descending')
+
+    def test_dc_has_no_default_sort(self):
+        assert sru.build_cql(index_set="dc", keyword="whale") == "cql.anywhere = whale"
+
+    def test_explicit_sort_overrides_default(self):
+        assert (sru.build_cql(index_set="alma", title="x", sort="alma.title/sort.ascending")
+                == 'alma.title = x sortBy alma.title/sort.ascending')
+
+    def test_empty_string_sort_disables(self):
+        assert sru.build_cql(index_set="alma", keyword="whale", sort="") == "alma.all_for_ui = whale"
+
+
+class TestSchemaResolvers:
+    def test_dnb_default_schema(self):
+        assert sru.server_default_schema("dnb") == "oai_dc"
+
+    def test_pitt_default_schema(self):
+        assert sru.server_default_schema("pitt") == "marcxml"
+
+    def test_pitt_default_index(self):
+        assert sru.server_default_index("pitt") == "alma"
+
+    def test_loc_default_index(self):
+        assert sru.server_default_index("loc") == "dc"
+
+    def test_unknown_server_schema_fallback(self):
+        assert sru.server_default_schema("http://unknown.example/sru") == "marcxml"
+
+    def test_unknown_server_index_fallback(self):
+        assert sru.server_default_index("http://unknown.example/sru") == "dc"
+
+
+# =====================================================================
+# Server-name fallback when explain omits databaseInfo/title
+# (Alma institutions often leave the SRU profile title blank, so explain
+# yields no title even though schemas/indexes parse. server.py falls back
+# to the configured server name. This tests parse_explain's half: a
+# databaseInfo-less doc parses with title "Unknown", schemas/indexes intact.)
+# =====================================================================
+
+EXPLAIN_XML_NO_DBINFO = """\
+<?xml version="1.0"?>
+<srw:explainResponse xmlns:srw="http://www.loc.gov/zing/srw/" xmlns:zr="http://explain.z3950.org/dtd/2.0/">
+  <srw:version>1.2</srw:version>
+  <srw:record>
+    <srw:recordData>
+      <zr:explain>
+        <zr:serverInfo protocol="SRU"><host>pitt.alma.exlibrisgroup.com</host></zr:serverInfo>
+        <zr:indexInfo>
+          <set identifier="x" name="alma"/>
+          <index sort="true"><title>Title</title><map><name set="alma">title</name></map></index>
+        </zr:indexInfo>
+        <zr:schemaInfo>
+          <schema identifier="marc" name="marcxml"><title>MARCXML</title></schema>
+        </zr:schemaInfo>
+      </zr:explain>
+    </srw:recordData>
+  </srw:record>
+</srw:explainResponse>
+"""
+
+
+class TestExplainMissingDatabaseInfo:
+    @pytest.mark.asyncio
+    async def test_explain_without_databaseinfo_still_parses(self, mock_sru_server):
+        mock_sru_server.get("http://test.example/sru").mock(
+            return_value=httpx.Response(200, text=EXPLAIN_XML_NO_DBINFO,
+                                        headers={"content-type": "text/xml"})
+        )
+        root = await sru.explain("http://test.example/sru")
+        info = sru.parse_explain(root)
+        # No databaseInfo -> title is "Unknown" at the parse layer (server.py
+        # then substitutes the configured server name).
+        assert info["title"] == "Unknown"
+        # ...but schemas and indexes still parse fine.
+        assert len(info["schemas"]) == 1
+        assert info["schemas"][0]["name"] == "marcxml"
+        assert len(info["indexes"]) == 1
+        assert info["indexes"][0]["name"] == "title"
+        assert info["indexes"][0]["sort"] is True
+
+    @pytest.mark.asyncio
+    async def test_explain_canonical_databaseinfo_title(self, mock_sru_server):
+        # Canonical ZeeRex: zr: prefix on databaseInfo, bare <title> with attrs.
+        xml = EXPLAIN_XML_NO_DBINFO.replace(
+            '<zr:serverInfo protocol="SRU"><host>pitt.alma.exlibrisgroup.com</host></zr:serverInfo>',
+            '<zr:databaseInfo><title lang="en" primary="true">Pitt ULS</title></zr:databaseInfo>'
+        )
+        mock_sru_server.get("http://test.example/sru").mock(
+            return_value=httpx.Response(200, text=xml,
+                                        headers={"content-type": "text/xml"})
+        )
+        root = await sru.explain("http://test.example/sru")
+        info = sru.parse_explain(root)
+        assert info["title"] == "Pitt ULS"
+
+
+# =====================================================================
+# DC records whose elements carry an inline xmlns (LoC-style).
+# xmltodict represents <title xmlns="...">X</title> as a dict
+# {'@xmlns': ..., '#text': 'X'}, not a bare string. Regression guard:
+# these must flatten to clean text, not stringified dicts, and must
+# render without list brackets (incl. language, a single-value field).
+# =====================================================================
+
+SEARCH_XML_DC_INLINE_NS = """\
+<?xml version="1.0"?>
+<srw:searchRetrieveResponse xmlns:srw="http://www.loc.gov/zing/srw/">
+  <srw:numberOfRecords>470</srw:numberOfRecords>
+  <srw:records>
+    <srw:record>
+      <srw:recordSchema>info:srw/schema/1/dc-v1.1</srw:recordSchema>
+      <srw:recordData>
+        <dc xmlns="info:srw/schema/1/dc-schema">
+          <title xmlns="http://purl.org/dc/elements/1.1/">Moby Dick ; Moby Dick</title>
+          <creator xmlns="http://purl.org/dc/elements/1.1/">Melville, Herman</creator>
+          <language xmlns="http://purl.org/dc/elements/1.1/">eng</language>
+          <identifier xmlns="http://purl.org/dc/elements/1.1/">123</identifier>
+          <identifier xmlns="http://purl.org/dc/elements/1.1/">456</identifier>
+        </dc>
+      </srw:recordData>
+    </srw:record>
+  </srw:records>
+</srw:searchRetrieveResponse>
+"""
+
+
+class TestDublinCoreInlineNamespace:
+    @pytest.mark.asyncio
+    async def test_dc_elements_with_inline_xmlns_flatten_to_text(self, mock_sru_server):
+        mock_sru_server.get("http://test.example/sru").mock(
+            return_value=httpx.Response(200, text=SEARCH_XML_DC_INLINE_NS,
+                                        headers={"content-type": "text/xml"})
+        )
+        root = await sru.search_retrieve("http://test.example/sru", 'cql.anywhere = "moby dick"')
+        res = sru.parse_search_results(root)
+        r0 = res["records"][0]
+        # Clean text, not stringified dicts:
+        assert r0["title"] == ["Moby Dick ; Moby Dick"]
+        assert r0["author"] == ["Melville, Herman"]
+        assert r0["language"] == ["eng"]
+        assert r0["identifier"] == ["123", "456"]
+        assert "{" not in str(r0["title"])  # no dict leakage
+
+    def test_text_values_helper(self):
+        assert sru._text_values("plain") == ["plain"]
+        assert sru._text_values({"@xmlns": "x", "#text": "wrapped"}) == ["wrapped"]
+        assert sru._text_values([{"#text": "a"}, "b"]) == ["a", "b"]
+        assert sru._text_values(None) == []
+        assert sru._text_values({"@xmlns": "x"}) == []   # no text -> dropped
+
+    def test_language_renders_without_brackets(self):
+        # A DC-parsed record has language as a list; the formatter must not
+        # print Python list syntax.
+        md = sru.format_search_results_markdown(
+            {"total": 1, "records": [{"title": ["T"], "language": ["eng"], "schema": "dc"}]}
+        )
+        assert "**Language:** eng" in md
+        assert "['eng']" not in md
+
+
+# =====================================================================
+# Capability discovery + on-disk cache (self-configuring layer)
+# Discovery validates/annotates curated config; never overrides it.
+# All tests redirect the cache to a temp dir so the real ~/.sru-mcp is
+# never touched.
+# =====================================================================
+
+import tempfile
+from pathlib import Path as _Path
+
+
+@pytest.fixture
+def temp_cache(monkeypatch):
+    """Redirect sru's on-disk cache to a throwaway temp dir."""
+    d = _Path(tempfile.mkdtemp())
+    monkeypatch.setattr(sru, "_CACHE_DIR", d)
+    monkeypatch.setattr(sru, "_CACHE_FILE", d / "explain_cache.json")
+    return d
+
+
+_DISCOVERY_INFO = {
+    "title": "University of Pittsburgh",
+    "schemas": [{"name": "marcxml"}, {"name": "dc"}, {"name": "mods"}],
+    "indexes": [
+        {"set": "alma", "name": "title", "title": "Title", "sort": True},
+        {"set": "alma", "name": "creator", "title": "Creator", "sort": True},
+        {"set": "alma", "name": "isbn", "title": "ISBN", "sort": False},
+        {"set": "alma", "name": "all_for_ui", "title": "Keyword", "sort": False},
+    ],
+}
+
+
+def _seed_profile(server="pitt"):
+    profile = sru._profile_from_explain(_DISCOVERY_INFO)
+    profile["fetched_at"] = "2026-06-30T18:30:00Z"
+    cache = sru._load_cache()
+    cache["servers"][server] = profile
+    sru._save_cache(cache)
+    return profile
+
+
+class TestCapabilityDiscovery:
+    def test_undiscovered_returns_none(self, temp_cache):
+        assert sru.get_capabilities("pitt") is None
+        # None means "unknown", callers must not warn or fail on it.
+        assert sru.index_exists("pitt", "alma.title") is None
+        assert sru.index_is_sortable("pitt", "alma.title") is None
+
+    def test_profile_distillation(self, temp_cache):
+        p = sru._profile_from_explain(_DISCOVERY_INFO)
+        assert p["title"] == "University of Pittsburgh"
+        assert p["schemas"] == ["marcxml", "dc", "mods"]
+        assert "alma.title" in p["indexes"]
+        assert p["indexes"]["alma.title"]["sortable"] is True
+        assert p["indexes"]["alma.isbn"]["sortable"] is False
+        assert set(p["sortable"]) == {"alma.title", "alma.creator"}
+
+    def test_cache_roundtrip(self, temp_cache):
+        _seed_profile("pitt")
+        assert sru._CACHE_FILE.exists()
+        # Fresh read from disk preserves the profile.
+        cache = sru._load_cache()
+        assert "pitt" in cache["servers"]
+        assert len(cache["servers"]["pitt"]["indexes"]) == 4
+
+    def test_index_exists_after_discovery(self, temp_cache):
+        _seed_profile("pitt")
+        assert sru.index_exists("pitt", "alma.title") is True
+        assert sru.index_exists("pitt", "alma.subjects") is False  # not in profile
+        assert sru.index_is_sortable("pitt", "alma.title") is True
+        assert sru.index_is_sortable("pitt", "alma.isbn") is False
+
+    def test_corrupt_cache_tolerated(self, temp_cache):
+        sru._CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        sru._CACHE_FILE.write_text("{ not valid json")
+        assert sru._load_cache() == {"version": sru._CACHE_VERSION, "servers": {}}
+
+    def test_wrong_version_cache_reset(self, temp_cache):
+        sru._CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        sru._CACHE_FILE.write_text('{"version": 999, "servers": {"x": {}}}')
+        # Unknown format -> start fresh rather than misread.
+        assert sru._load_cache() == {"version": sru._CACHE_VERSION, "servers": {}}
+
+
+class TestFieldsToIndexes:
+    def test_maps_only_provided_fields(self):
+        planned = sru.fields_to_indexes(
+            "alma", {"title": "whale", "author": None, "subject": "x", "keyword": None}
+        )
+        assert planned == {"title": "alma.title", "subject": "alma.subjects"}
+
+    def test_dc_index_set(self):
+        planned = sru.fields_to_indexes("dc", {"title": "x", "keyword": "y"})
+        assert planned == {"title": "dc.title", "keyword": "cql.anywhere"}
+
+    def test_unknown_set_falls_back_to_dc(self):
+        planned = sru.fields_to_indexes("nonsense", {"title": "x"})
+        assert planned == {"title": "dc.title"}

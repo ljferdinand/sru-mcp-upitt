@@ -86,6 +86,15 @@ async def sru_explain(
     try:
         root = await sru.explain(_resolve_url(server), username, password)
         info = sru.parse_explain(root)
+        # Many Alma institutions leave the SRU profile's databaseInfo/title blank,
+        # so explain yields no title even though schemas/indexes parse fine. Fall
+        # back to the configured server name (or its URL) rather than "Unknown".
+        if not info.get("title") or info["title"] == "Unknown":
+            rec = sru.get_server(server)
+            if rec and rec.get("name"):
+                info["title"] = rec["name"]
+            else:
+                info["title"] = _resolve_url(server)
         return sru.format_explain_markdown(info)
     except sru.SRUError as exc:
         return f"**Error:** {exc}"
@@ -151,8 +160,9 @@ async def sru_search(
     record_schema: Annotated[
         str | None,
         Field(description="Record schema to request (e.g., 'dc', 'marcxml', 'mods'). "
-                          "Defaults to 'marcxml'. Use sru_explain to see supported schemas."),
-    ] = "marcxml",
+                          "If omitted, the server's default schema from servers.json "
+                          "is used. Use sru_explain to see supported schemas."),
+    ] = None,
     username: Annotated[str | None, Field(description="Optional HTTP basic auth username")] = None,
     password: Annotated[str | None, Field(description="Optional HTTP basic auth password")] = None,
 ) -> str:
@@ -164,10 +174,11 @@ async def sru_search(
     For pagination, increment start_record by max_records on each call.
     The response includes the total number of matching records.
     """
+    schema = record_schema or sru.server_default_schema(server)
     try:
         root = await sru.search_retrieve(
             _resolve_url(server), cql_query, max_records, start_record,
-            record_schema, username, password,
+            schema, username, password,
         )
         results = sru.parse_search_results(root)
         return sru.format_search_results_markdown(results)
@@ -199,9 +210,17 @@ async def sru_search_books(
     ] = 1,
     record_schema: Annotated[
         str | None,
-        Field(description="Record schema to request (e.g., 'dc', 'marcxml'). "
-                          "Defaults to 'marcxml'."),
-    ] = "marcxml",
+        Field(description="Record schema to request (e.g., 'dc', 'marcxml', 'oai_dc'). "
+                          "If omitted, the server's default schema from servers.json "
+                          "is used (e.g. oai_dc for DNB, marcxml for Alma)."),
+    ] = None,
+    sort: Annotated[
+        str | None,
+        Field(description="Optional CQL sort spec, e.g. 'alma.title/sort.ascending'. "
+                          "If omitted, Alma servers default to relevance "
+                          "(alma.rank/sort.descending); other servers use their own "
+                          "default ordering. Pass an empty string to disable sorting."),
+    ] = None,
 ) -> str:
     """Search an SRU library catalog by common bibliographic fields.
 
@@ -210,13 +229,20 @@ async def sru_search_books(
 
     Returns a markdown summary of matching records.
 
-    Example using the Library of Congress:
-      server = "loc"
-      title = "Moby Dick"
-      author = "Melville"
+    Example (German National Library, works out of the box):
+      server = "dnb"
+      keyword = "Goethe"
+
+    Note: field-based search uses each server's index set (from servers.json
+    "default_index"). For Ex Libris Alma servers (e.g. "pitt") that means the
+    alma.* indexes are used automatically, results are relevance-sorted by
+    default, and the record schema defaults to each server's configured schema.
     """
+    index_set = sru.server_default_index(server)
     try:
         cql = sru.build_cql(
+            index_set=index_set,
+            sort=sort,
             title=title,
             author=author,
             isbn=isbn,
@@ -228,13 +254,42 @@ async def sru_search_books(
     except ValueError as exc:
         return f"**Error:** {exc}"
 
+    # Resolve the record schema from the server config unless the caller forced one.
+    schema = record_schema or sru.server_default_schema(server)
+    # Alma caps maximumRecords at 50 and errors above it.
+    if index_set == "alma" and max_records > 50:
+        max_records = 50
+
+    # Advisory capability validation: if this server has been discovered (via
+    # sru_refresh_capabilities), check that each mapped index actually exists on
+    # it, and surface a warning rather than letting a missing index produce a
+    # silent zero-result. Never blocks: undiscovered servers (None) are skipped,
+    # and the universal keyword index (cql.anywhere) is not a catalog index so it
+    # is never warned on.
+    warnings: list[str] = []
+    planned = sru.fields_to_indexes(index_set, {
+        "title": title, "author": author, "isbn": isbn, "subject": subject,
+        "publisher": publisher, "year": year, "keyword": keyword,
+    })
+    for field, idx in planned.items():
+        if idx == "cql.anywhere":
+            continue
+        exists = sru.index_exists(server, idx)
+        if exists is False:
+            warnings.append(
+                f"index `{idx}` (for {field}) is not in {server}'s discovered "
+                f"capabilities — results may be empty. Run sru_refresh_capabilities "
+                f"or check sru_list_indexes."
+            )
+    warning_block = ("> ⚠️ " + "\n> ".join(warnings) + "\n\n") if warnings else ""
+
     try:
         root = await sru.search_retrieve(
-            _resolve_url(server), cql, max_records, start_record, record_schema,
+            _resolve_url(server), cql, max_records, start_record, schema,
         )
         results = sru.parse_search_results(root)
         md = sru.format_search_results_markdown(results)
-        return f"**Query:** `{cql}`\n\n{md}"
+        return f"{warning_block}**Query:** `{cql}`\n\n{md}"
     except sru.SRUError as exc:
         return f"**Error:** {exc}"
 
@@ -280,6 +335,47 @@ async def sru_scan(
         return "\n".join(lines)
     except sru.SRUError as exc:
         return f"**Error:** {exc}"
+
+
+# ---------------------------------------------------------------------------
+# Tool: sru_refresh_capabilities
+# ---------------------------------------------------------------------------
+
+@mcp.tool(annotations={"openWorldHint": True})
+async def sru_refresh_capabilities(
+    server: Annotated[str, _SERVER_URL_FIELD],
+    username: Annotated[str | None, Field(description="Optional HTTP basic auth username")] = None,
+    password: Annotated[str | None, Field(description="Optional HTTP basic auth password")] = None,
+) -> str:
+    """Fetch a server's explain document and cache its capabilities on disk.
+
+    This discovers and stores which indexes the server exposes (and which are
+    sortable) plus its supported record schemas. Once cached, sru_search_books
+    can warn when a planned search uses an index the server doesn't actually
+    expose, instead of returning a silent zero-result. The cache persists across
+    restarts; re-run this when a catalog's configuration changes.
+
+    Discovery is an enhancement, not a requirement: searches work the same
+    whether or not a server has been refreshed.
+    """
+    profile = await sru.discover_capabilities(_resolve_url(server), username, password)
+    if profile is None:
+        return (
+            f"**Could not discover capabilities for `{server}`.** The explain "
+            f"request failed or returned nothing usable. Searches will continue "
+            f"to use the configured defaults from servers.json."
+        )
+    n_indexes = len(profile.get("indexes", {}))
+    sortable = profile.get("sortable", [])
+    schemas = profile.get("schemas", [])
+    lines = [
+        f"**Cached capabilities for `{server}`** ({profile.get('title') or server}).",
+        f"- Indexes discovered: {n_indexes}",
+        f"- Sortable indexes: {', '.join(f'`{s}`' for s in sortable) if sortable else 'none advertised'}",
+        f"- Supported schemas: {', '.join(schemas) if schemas else 'none listed'}",
+        f"- Fetched: {profile.get('fetched_at', 'unknown')}",
+    ]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

@@ -6,3 +6,6 @@ build/
 .venv/
 .env
 .pytest_cache/
+
+.DS_Store
+sru-mcp-updated.zip

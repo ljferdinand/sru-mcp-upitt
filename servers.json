@@ -47,11 +47,14 @@
   {
     "id": "kb",
     "name": "Koninklijke Bibliotheek",
-    "url": "http://jsru.kb.nl/sru",
+    "url": "http://jsru.kb.nl/sru/sru",
     "version": "1.1",
     "default_schema": "dc",
     "default_index": "dc",
-    "notes": "Netherlands national library"
+    "notes": "Netherlands national library (GGC catalog via x-collection=GGC)",
+    "extra_params": {
+      "x-collection": "GGC"
+    }
   },
   {
     "id": "bibsys",
@@ -70,5 +73,14 @@
     "default_schema": "dc",
     "default_index": "dc",
     "notes": "Australian national library aggregator"
+  },
+  {
+    "id": "pitt",
+    "name": "University of Pittsburgh",
+    "url": "https://pitt.alma.exlibrisgroup.com/view/sru/01PITT_INST",
+    "version": "1.2",
+    "default_schema": "marcxml",
+    "default_index": "alma",
+    "notes": "University Library System (ULS), Ex Libris Alma; institution code 01PITT_INST; CQL index set 'alma'"
   }
 ]
