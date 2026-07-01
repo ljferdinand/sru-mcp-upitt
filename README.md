@@ -4,8 +4,9 @@ An MCP server that searches library catalogs worldwide using the [SRU (Search/Re
 
 ## Features
 
-- **6 tools** for LLM-driven bibliographic search
+- **10 tools** for LLM-driven bibliographic search
 - **9 pre-configured servers** including the Library of Congress, BnF, DNB, the KB, Trove, and a University of Pittsburgh (Ex Libris Alma) endpoint
+- **Add your own library** with `sru_add_target` — no JSON editing. It builds the endpoint URL for your ILS platform, verifies it with a live probe, and registers it (see [Add your own library](#add-your-own-library) below)
 - Sends the SRU **version per server** (1.1 / 1.2) from `servers.json`, and omits the optional `recordPacking` parameter (`xml` is the SRU default, and some servers such as the LoC reject it when present)
 - Parses **MARCXML** and **Dublin Core** record formats
 - Supports any SRU-compliant server: pass a URL or use a built-in server ID
@@ -141,12 +142,16 @@ Use the path to the interpreter that has the dependencies (the venv's `python` i
 
 | Tool | Description |
 |------|-------------|
-| `sru_list_servers` | List all pre-configured library catalog servers |
+| `sru_list_servers` | List all catalog servers (built-in and user-added) |
+| `sru_list_platforms` | List the ILS platforms `sru_add_target` supports and the inputs each needs |
+| `sru_add_target` | Add your own library's SRU endpoint (builds the URL, probes it, registers it) |
+| `sru_remove_target` | Remove a server you added with `sru_add_target` |
 | `sru_explain` | Get a server's capabilities, supported schemas, and indexes |
 | `sru_list_indexes` | List available search indexes on a server (use to discover index names for CQL) |
 | `sru_search` | Execute a raw CQL query |
 | `sru_search_books` | Field-based search (title, author, ISBN, subject, publisher, year, keyword) |
 | `sru_scan` | Browse index terms near a given term (SRU scan operation) |
+| `sru_refresh_capabilities` | Fetch and cache a server's explain profile (indexes, sortability, schemas) |
 
 ### Example Usage
 
@@ -169,6 +174,35 @@ sru_list_indexes(server="pitt", filter_text="title")
 sru_search(server="pitt", cql_query='alma.title all "moby dick" AND alma.creator all melville')
 ```
 
+## Add your own library
+
+Most people have never met SRU, because it is historically an *institution-to-institution* protocol — the plumbing behind copy cataloging, interlibrary loan, and discovery layers, not something end users touch. But if you do work with a specific library's catalog, SRU is a real, standardized way to search it directly, and this server lets you register your library and query it like any built-in one. No `servers.json` editing required.
+
+### What to expect
+
+- The tool searches and retrieves **bibliographic metadata** (title, author, subject, ISBN, and so on) and returns catalog **records** in MARCXML or Dublin Core. It does not retrieve full text.
+- Indexes and record schemas **vary per institution**, which is why the server discovers them (via the explain probe) rather than assuming.
+- Some catalogs require **authentication** the tool does not manage, and **many institutions do not expose SRU publicly at all**. A failed add usually means "that endpoint is not open," not "the tool is broken."
+
+### Finding your endpoint
+
+Run `sru_list_platforms` to see what each platform needs. Then call `sru_add_target`. The inputs depend on your library's system:
+
+- **Alma** (Ex Libris): supply your **Alma domain** and **institution code**. The domain is the host in your browser's address bar when you are logged into Alma (for example `pitt.alma.exlibrisgroup.com`, or a datacenter form like `eu03.alma.exlibrisgroup.com`). The institution code looks like `01PITT_INST` and lives in Alma's configuration, or a systems librarian can tell you. Note that **SRU is off by default in Alma** and must be enabled institution-side; if the probe fails, that is the first thing to check.
+- **Koha / FOLIO**: supply the **host** (and for FOLIO the tenant **dbname**); the port and database default to the usual values (`9999`/`biblios` for Koha, `9997` for FOLIO) and can be overridden. These endpoints are frequently internal-only or an optional add-on, so a public probe may not answer. Your systems administrator has these details.
+- **Other / any SRU server**: if you already have a working SRU **base URL** from anywhere, use the `other` platform and pass it directly. The record schema is chosen from what the server advertises in its explain response.
+
+### Example
+
+```
+sru_list_platforms
+sru_add_target(platform="alma", name="My University", domain="myuni.alma.exlibrisgroup.com", institution_code="01MYUNI_INST")
+sru_search_books(server="my-university", keyword="climate")
+sru_remove_target(key="my-university")   # if you want to undo it
+```
+
+The added server is written to `~/.sru-mcp/user_servers.json`, works immediately in the session, and persists across restarts. It shows up in `sru_list_servers` marked "user-added". Built-in servers cannot be overwritten or removed. Credentials, if you pass them, are used only for the probe and are never stored.
+
 ## Pre-configured Servers
 
 | ID | Name | Version | Schema | Notes |
@@ -185,13 +219,15 @@ sru_search(server="pitt", cql_query='alma.title all "moby dick" AND alma.creator
 
 ### Adding a server
 
-Edit `servers.json`. Each entry has these keys:
+Two ways. For most users, `sru_add_target` (above) is the easiest and needs no file editing. To add a server permanently in the repo (so it ships as a built-in), edit `servers.json`. Each entry has these keys:
 
 - `id`, `name`, `url`, `notes`
 - `version`: the SRU version the endpoint expects (`1.1` or `1.2`). The client sends this per request.
 - `default_schema`: the record schema label for the server.
 - `default_index`: the CQL index set the field-based search should use (`dc` by default, `alma` for Ex Libris Alma).
 - `extra_params` (optional): an object of extra query parameters appended to every request, for endpoints that need them (for example, the KB requires `{"x-collection": "GGC"}`).
+
+Servers you add with `sru_add_target` are stored separately in `~/.sru-mcp/user_servers.json` (not the repo). Resolution precedence is **`servers.json` > `user_servers.json` > discovered profile > built-in default**, so a shipped server always wins and a user entry can never shadow it.
 
 ## Search syntax and index sets
 
@@ -213,7 +249,8 @@ Alma's SRU endpoint returns matches in ascending title-alphabetical order unless
 The server can fetch a catalog's explain document once, distill it into a
 compact capability profile, and cache that profile on disk
 (`~/.sru-mcp/explain_cache.json`). Run `sru_refresh_capabilities` against a
-server to populate it. The profile records which indexes the server exposes,
+server to populate it (and `sru_add_target` populates it automatically when it
+registers a new server). The profile records which indexes the server exposes,
 which are sortable, and which record schemas it supports.
 
 Discovery is layered strictly behind the hand-maintained config — precedence is
@@ -258,9 +295,10 @@ pip install pytest pytest-asyncio respx
 
 # Run tests
 python3 -m pytest test_sru.py test_server.py -v
+python3 test_targets.py          # identity-discovery core (pure, no network deps)
 
 # Syntax check
-python3 -m py_compile sru.py server.py
+python3 -m py_compile sru.py server.py targets.py
 
 # Test with MCP Inspector
 npx @modelcontextprotocol/inspector python server.py
@@ -269,12 +307,16 @@ npx @modelcontextprotocol/inspector python server.py
 ## Project Structure
 
 ```
-server.py       FastMCP server — registers the six tools
-sru.py          SRU protocol client — HTTP, CQL builder, parsing, formatting
-servers.json    Server registry (loaded at import time)
-test_sru.py     Tests for sru.py
-test_server.py  Tests for server.py
+server.py          FastMCP server — registers the tools
+sru.py             SRU protocol client — HTTP, CQL builder, parsing, formatting, capability cache
+targets.py         Identity-discovery: platform templates, URL assembly, user_servers persistence
+servers.json       Built-in server registry (loaded at import time)
+test_sru.py        Tests for sru.py
+test_server.py     Tests for server.py
+test_targets.py    Tests for targets.py (pure, offline)
 ```
+
+At runtime the server also reads and writes `~/.sru-mcp/` (outside the repo): `user_servers.json` for servers you add, and `explain_cache.json` for discovered capabilities.
 
 ## License
 

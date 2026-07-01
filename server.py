@@ -4,7 +4,8 @@ Provides tools for searching library catalogs via the SRU
 (Search/Retrieve via URL) protocol.
 
 Servers are configured in servers.json. Use sru_list_servers to see all
-available servers, or pass any SRU server URL directly.
+available servers, or pass any SRU server URL directly. Add your own library's
+endpoint with sru_add_target (see sru_list_platforms for what to supply).
 
 Run:
   python server.py
@@ -16,6 +17,7 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 import sru
+import targets
 
 # Build a compact server list string for tool descriptions
 _SERVER_HINT = ", ".join(
@@ -35,7 +37,9 @@ mcp = FastMCP(
         "Search library catalogs using the SRU (Search/Retrieve via URL) protocol. "
         "Use sru_list_servers to discover available servers, sru_explain to inspect "
         "a server's capabilities, sru_search_books for simple field-based searches, "
-        f"or sru_search for raw CQL queries. Available servers: {_SERVER_HINT}."
+        "or sru_search for raw CQL queries. To search your own library, register it "
+        "with sru_add_target (sru_list_platforms shows the inputs each ILS needs). "
+        f"Available servers: {_SERVER_HINT}."
     ),
 )
 
@@ -54,17 +58,236 @@ def _resolve_url(id_or_url: str) -> str:
 def sru_list_servers() -> str:
     """List all known SRU library catalog servers.
 
-    Returns a table with ID, name, URL, default schema, and notes for each
-    server. Pass the ID or URL to other sru_* tools.
+    Returns a table with ID, name, URL, default schema, source (built-in vs
+    user-added), and notes for each server. Pass the ID or URL to other sru_*
+    tools. User-added servers come from sru_add_target.
     """
-    lines = ["| ID | Name | URL | Schema | Notes |",
-             "|----|------|-----|--------|-------|"]
-    for s in sru.SERVERS:
+    shipped_ids = {s["id"] for s in sru.SERVERS}
+    lines = ["| ID | Name | URL | Schema | Source | Notes |",
+             "|----|------|-----|--------|--------|-------|"]
+    for s in sru.all_servers():
+        source = "built-in" if s["id"] in shipped_ids else "user-added"
         lines.append(
             f"| {s['id']} | {s['name']} | {s['url']} "
-            f"| {s['default_schema']} | {s['notes']} |"
+            f"| {s.get('default_schema', '')} | {source} | {s.get('notes', '')} |"
         )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tool: sru_list_platforms
+# ---------------------------------------------------------------------------
+
+@mcp.tool(annotations={"readOnlyHint": True})
+def sru_list_platforms() -> str:
+    """List the ILS platforms sru_add_target can register, and the inputs each needs.
+
+    Run this before sru_add_target so you know what to supply. SRU is
+    historically an institution-to-institution protocol, so if you are not sure
+    what system your library runs, ask a systems librarian — or, if you already
+    have a working SRU base URL, use the 'other' platform and pass it directly.
+    """
+    lines = ["| Platform | Kind | Required inputs | Optional (default) | Notes |",
+             "|----------|------|-----------------|--------------------|-------|"]
+    for p in targets.list_platforms():
+        req = ", ".join(p["required_inputs"]) or "—"
+        opt = ", ".join(f"{k}={v}" for k, v in p["optional_inputs"].items()) or "—"
+        lines.append(f"| {p['platform']} | {p['kind']} | {req} | {opt} | {p['description']} |")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tool: sru_add_target
+# ---------------------------------------------------------------------------
+
+@mcp.tool(annotations={"openWorldHint": True})
+async def sru_add_target(
+    platform: Annotated[
+        str,
+        Field(description="ILS platform: 'alma', 'koha', 'folio', or 'other'. See sru_list_platforms."),
+    ],
+    name: Annotated[
+        str,
+        Field(description="Human-readable name for the catalog, e.g. 'University of Pittsburgh'."),
+    ],
+    key: Annotated[
+        str | None,
+        Field(description="Optional short id used to refer to this server in other tools "
+                          "(e.g. 'pitt'). Defaults to a slug of name. Must be unique; a shipped "
+                          "server's id cannot be overwritten."),
+    ] = None,
+    domain: Annotated[
+        str | None,
+        Field(description="Alma: the Alma host, e.g. pitt.alma.exlibrisgroup.com — the domain in "
+                          "your browser address bar when logged into Alma."),
+    ] = None,
+    institution_code: Annotated[
+        str | None,
+        Field(description="Alma: institution code, e.g. 01PITT_INST."),
+    ] = None,
+    host: Annotated[
+        str | None,
+        Field(description="Koha/FOLIO: the server hostname."),
+    ] = None,
+    port: Annotated[
+        str | None,
+        Field(description="Koha/FOLIO: the SRU port (Koha default 9999, FOLIO default 9997)."),
+    ] = None,
+    database: Annotated[
+        str | None,
+        Field(description="Koha: the SRU database (default 'biblios')."),
+    ] = None,
+    dbname: Annotated[
+        str | None,
+        Field(description="FOLIO: the tenant / database name."),
+    ] = None,
+    scheme: Annotated[
+        str | None,
+        Field(description="Koha/FOLIO: 'http' or 'https' (default http)."),
+    ] = None,
+    base_url: Annotated[
+        str | None,
+        Field(description="'other' platform: the full SRU base URL, without a query string."),
+    ] = None,
+    username: Annotated[
+        str | None,
+        Field(description="Optional HTTP basic auth username, used ONLY to probe; never stored."),
+    ] = None,
+    password: Annotated[
+        str | None,
+        Field(description="Optional HTTP basic auth password, used ONLY to probe; never stored."),
+    ] = None,
+) -> str:
+    """Register the SRU endpoint for a library so you can search it like the built-in servers.
+
+    Assembles the endpoint URL for the chosen platform, verifies it with an SRU
+    explain probe, and on success saves it to ~/.sru-mcp/user_servers.json and
+    caches its capabilities. On failure nothing is saved, and the reason is
+    reported. Credentials, if supplied, are used only for the probe and are
+    never stored.
+
+    After adding, use the key with sru_search_books, sru_search, sru_explain,
+    sru_list_indexes, etc. The added server works immediately in this session
+    (no restart needed for the target itself).
+
+    A common failure is not a bug: many institutions have not enabled SRU, or do
+    not expose the endpoint publicly. For Alma specifically, SRU is off by
+    default and must be turned on institution-side.
+
+    Run sru_list_platforms first to see which inputs each platform needs.
+    """
+    inputs = {
+        "domain": domain,
+        "institution_code": institution_code,
+        "host": host,
+        "port": port,
+        "database": database,
+        "dbname": dbname,
+        "scheme": scheme,
+        "base_url": base_url,
+    }
+    inputs = {k: v for k, v in inputs.items() if v not in (None, "")}
+
+    # 1. Assemble the base URL from the platform template.
+    try:
+        url, advisories = targets.assemble_url(platform, inputs)
+    except ValueError as exc:
+        return f"**Could not build the URL:** {exc}"
+
+    # 2. Resolve a unique registry key (never overwriting a shipped/user id).
+    existing = [s["id"] for s in sru.all_servers()]
+    resolved_key, key_err = targets.resolve_key(name, key, existing)
+    if key_err:
+        return f"**{key_err}**"
+
+    advisory_block = (
+        "\n".join(f"> note: {a}" for a in advisories) + "\n\n"
+    ) if advisories else ""
+
+    # 3. Probe with explain BEFORE registering anything. Force the platform's
+    #    SRU version, since the server is not yet in the registry (it would
+    #    otherwise default to 1.2, wrong for the 1.1 Koha/FOLIO endpoints).
+    platform_version = (
+        targets.PLATFORM_TEMPLATES.get(platform, {}).get("defaults", {}).get("version")
+    )
+    try:
+        root = await sru.explain(url, username, password, version=platform_version)
+        info = sru.parse_explain(root)
+    except sru.SRUError as exc:
+        return (
+            f"{advisory_block}"
+            f"**Probe failed — nothing was saved.** Tried `{url}`.\n\n"
+            f"{exc}\n\n"
+            f"Common causes: the institution has not enabled SRU, the endpoint is "
+            f"not publicly reachable, or an input is off. For Alma, confirm the "
+            f"domain and institution code and that SRU is turned on. Run "
+            f"sru_list_platforms to review the required inputs."
+        )
+
+    # 4. Probe succeeded: choose the record schema, build the entry, register,
+    #    and cache the capabilities from the explain we just fetched.
+    advertised = [s.get("name", "") for s in info.get("schemas", []) if s.get("name")]
+    schema = targets.choose_default_schema(platform, advertised)
+    entry = targets.build_entry(resolved_key, name, platform, url, inputs, schema)
+    saved, _ = targets.register_user_server(entry)
+
+    profile = sru.cache_capabilities_from_explain(resolved_key, info)
+    n_indexes = len(profile.get("indexes", {}))
+    schemas = profile.get("schemas", [])
+    # Many Alma profiles leave databaseInfo/title blank, so parse_explain yields
+    # "Unknown"; fall back to the name the user supplied (as sru_explain does).
+    title = info.get("title")
+    if not title or title == "Unknown":
+        title = name
+
+    persist_note = "" if saved else (
+        "\n\n> warning: the server is usable now but could not be written to "
+        "~/.sru-mcp/user_servers.json, so it will not persist across a restart."
+    )
+    return (
+        f"{advisory_block}"
+        f"**Added `{resolved_key}` — {title}.**\n"
+        f"- URL: `{url}`\n"
+        f"- Platform: {platform}\n"
+        f"- Record schema: {schema}\n"
+        f"- Indexes discovered: {n_indexes}\n"
+        f"- Supported schemas: {', '.join(schemas) if schemas else 'none listed'}\n\n"
+        f'Try it: `sru_search_books(server="{resolved_key}", keyword="...")`.'
+        f"{persist_note}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool: sru_remove_target
+# ---------------------------------------------------------------------------
+
+@mcp.tool(annotations={"openWorldHint": True})
+def sru_remove_target(
+    key: Annotated[
+        str,
+        Field(description="The id of the user-added server to remove (see sru_list_servers). "
+                          "Built-in servers cannot be removed."),
+    ],
+) -> str:
+    """Remove a server previously added with sru_add_target.
+
+    Deletes the entry from ~/.sru-mcp/user_servers.json and drops its cached
+    capabilities. Only user-added servers can be removed; the built-in servers
+    (loc, dnb, pitt, etc.) are part of the tool and are refused.
+    """
+    if key in {s["id"] for s in sru.SERVERS}:
+        return (
+            f"**`{key}` is a built-in server and cannot be removed.** "
+            f"Only servers added with sru_add_target can be removed."
+        )
+    removed, _ = targets.remove_user_server(key)
+    if not removed:
+        return (
+            f"**No user-added server with id `{key}`.** "
+            f"Run sru_list_servers to see what is registered."
+        )
+    sru.uncache_server(key)
+    return f"**Removed `{key}`.** Its entry and cached capabilities are gone."
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +579,9 @@ async def sru_refresh_capabilities(
     restarts; re-run this when a catalog's configuration changes.
 
     Discovery is an enhancement, not a requirement: searches work the same
-    whether or not a server has been refreshed.
+    whether or not a server has been refreshed. (sru_add_target caches
+    capabilities automatically when it registers a server, so a manual refresh
+    is only needed later, if a catalog changes.)
     """
     profile = await sru.discover_capabilities(_resolve_url(server), username, password)
     if profile is None:

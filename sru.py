@@ -13,6 +13,8 @@ from typing import Any
 import httpx
 import xmltodict
 
+import targets
+
 
 # ---------------------------------------------------------------------------
 # Server registry  (loaded from servers.json next to this file)
@@ -27,12 +29,35 @@ SERVERS: list[dict[str, str]] = json.loads(_SERVERS_FILE.read_text())
 KNOWN_SERVERS: dict[str, str] = {s["id"]: s["url"] for s in SERVERS}
 
 
-def get_server(id_or_url: str) -> dict[str, str] | None:
-    """Return the server record for a given ID or URL, or None if not found."""
+def get_server(id_or_url: str) -> dict[str, Any] | None:
+    """Return the server record for a given ID or URL, or None if not found.
+
+    Checks shipped servers.json first, then user-added servers from
+    ~/.sru-mcp/user_servers.json (registered via sru_add_target). servers.json
+    wins on an id/url collision, so a user entry can never shadow a curated one.
+    User servers are read fresh from disk on each call, so a target added during
+    a session is immediately usable without a restart."""
     for s in SERVERS:
         if s["id"] == id_or_url or s["url"] == id_or_url:
             return s
+    for s in targets.load_user_servers():
+        if s.get("id") == id_or_url or s.get("url") == id_or_url:
+            return s
     return None
+
+
+def all_servers() -> list[dict[str, Any]]:
+    """Shipped servers plus user-added ones, shipped winning on id collision.
+
+    Used by sru_list_servers (display) and by sru_add_target (uniqueness check
+    for new keys). A user entry whose id duplicates a shipped one is dropped
+    from the merged view, matching get_server's precedence."""
+    shipped_ids = {s["id"] for s in SERVERS}
+    merged: list[dict[str, Any]] = list(SERVERS)
+    for u in targets.load_user_servers():
+        if u.get("id") not in shipped_ids:
+            merged.append(u)
+    return merged
 
 
 def _server_version(server_url: str, default: str = "1.2") -> str:
@@ -167,6 +192,35 @@ async def discover_capabilities(
     cache["servers"][_cache_key(id_or_url)] = profile
     _save_cache(cache)
     return profile
+
+
+def cache_capabilities_from_explain(id_or_url: str, info: dict[str, Any]) -> dict[str, Any]:
+    """Write a capability profile to the cache from an ALREADY-parsed explain
+    (parse_explain output), keyed by the server id/url. Returns the profile.
+
+    Used by sru_add_target, which has just fetched explain to probe a new
+    endpoint and should not fetch it again. Mirrors discover_capabilities'
+    caching without the network round trip. Call AFTER the server is registered
+    so _cache_key resolves to the server's id."""
+    profile = _profile_from_explain(info)
+    profile["fetched_at"] = _utc_now_iso()
+    cache = _load_cache()
+    cache["servers"][_cache_key(id_or_url)] = profile
+    _save_cache(cache)
+    return profile
+
+
+def uncache_server(key: str) -> bool:
+    """Drop a server's cached capability profile by id. Returns whether an entry
+    was removed. Used by sru_remove_target so a removed server leaves no stale
+    cache behind. Pops by the literal id (which is how add-time caching keyed
+    it, since the server was registered at that point)."""
+    cache = _load_cache()
+    if key in cache.get("servers", {}):
+        del cache["servers"][key]
+        _save_cache(cache)
+        return True
+    return False
 
 
 def get_capabilities(id_or_url: str) -> dict[str, Any] | None:
@@ -381,14 +435,21 @@ async def explain(
     server_url: str,
     username: str | None = None,
     password: str | None = None,
+    version: str | None = None,
 ) -> dict[str, Any]:
-    """Execute an SRU explain request and return the parsed response dict."""
+    """Execute an SRU explain request and return the parsed response dict.
+
+    version: force a specific SRU version for this request. If omitted, the
+    version is resolved from servers.json (default 1.2). sru_add_target passes
+    the platform's version explicitly, because a newly-probed endpoint is not
+    yet in the registry and would otherwise default to 1.2 (wrong for the 1.1
+    Koha/FOLIO endpoints)."""
     # Note: recordPacking/recordXMLEscaping is intentionally omitted. "xml" is
     # the SRU default, and sending it explicitly makes some servers (the Library
     # of Congress lx2 endpoint) return HTTP 500.
     params = {
         "operation": "explain",
-        "version": _server_version(server_url),
+        "version": version or _server_version(server_url),
     }
     params.update(_server_extra_params(server_url))
     data = await _get_xml(server_url, params, username, password)
