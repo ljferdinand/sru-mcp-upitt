@@ -37,3 +37,75 @@ def test_build_cql_bib_keyword_uses_bib_anywhere():
 def test_fields_to_indexes_bib():
     planned = sru.fields_to_indexes("bib", {"title": "x", "author": "y", "isbn": None})
     assert planned == {"title": "bib.title", "author": "bib.author"}
+
+
+# --- Step C / #3: unwrapped Dublin Core record parse (KB jsru) --------------
+
+def test_has_dublin_core_elements():
+    # Unwrapped DC: dc:* elements sit directly under recordData.
+    assert sru._has_dublin_core_elements({"dc:title": "x", "dc:creator": "y"}) is True
+    # MARCXML recordData's child is <record>, whose localname is not a DC
+    # element, so this must not mis-fire on MARC.
+    assert sru._has_dublin_core_elements({"record": {"@xmlns": "..."}}) is False
+    # A wrapped-DC recordData carries a <dc> child (localname "dc"), which is
+    # handled by the earlier branch and is deliberately NOT a DC element name.
+    assert sru._has_dublin_core_elements({"srw_dc:dc": {"dc:title": "x"}}) is False
+    assert sru._has_dublin_core_elements("not a dict") is False
+
+
+def test_parse_unwrapped_dublin_core():
+    # KB's jsru endpoint returns dc:* elements directly under recordData with no
+    # <dc> wrapper (unlike LoC/DNB, which wrap them in srw_dc:dc). The parser
+    # must extract fields rather than fall through to {"raw": ...} ("[No title]").
+    record_data = {
+        "dc:title": "Rembrandt 'Rembrandt'",
+        "dc:creator": "Giltaij, Jeroen",
+        "dc:subject": ["Rembrandt", "schilderkunst"],
+        "dc:language": "dut",
+    }
+    parsed = sru._parse_record_data(record_data, "dc")
+    assert parsed["title"] == ["Rembrandt 'Rembrandt'"]
+    assert parsed["author"] == ["Giltaij, Jeroen"]
+    assert parsed["subject"] == ["Rembrandt", "schilderkunst"]
+    assert "raw" not in parsed
+
+
+# --- Step D / #6: scan diagnostic surfacing ---------------------------------
+
+def test_diagnostic_message_scan_response_shape():
+    # LoC lx2 returns the unsupported-scan diagnostic inside a scanResponse,
+    # namespaced with a zs: prefix. _diagnostic_message reads it namespace-
+    # agnostically (scan() resolves the scanResponse envelope before calling).
+    root = {
+        "zs:diagnostics": {
+            "zs:diagnostic": {
+                "zs:uri": "info:srw/diagnostic/1/4",
+                "zs:details": "scan",
+                "zs:message": "Unsupported operation",
+            }
+        }
+    }
+    assert sru._diagnostic_message(root) == "Unsupported operation"
+
+
+def test_diagnostic_message_alma_envelope_shape():
+    # Alma reports the unsupported scan as a diagnostic wrapped in a
+    # searchRetrieveResponse envelope; scan() resolves that envelope, then
+    # _diagnostic_message extracts the message identically.
+    root = {
+        "diagnostics": {
+            "diagnostic": {
+                "uri": "info:srw/diagnostic/1/4",
+                "message": "The sru operation is not supported",
+            }
+        }
+    }
+    assert sru._diagnostic_message(root) == "The sru operation is not supported"
+
+
+def test_diagnostic_message_details_fallback_and_none():
+    # Falls back to details when there is no message element.
+    root = {"diagnostics": {"diagnostic": {"details": "boom"}}}
+    assert sru._diagnostic_message(root) == "boom"
+    # A normal response with no diagnostics yields None (no error raised).
+    assert sru._diagnostic_message({"records": {}}) is None
