@@ -6,7 +6,10 @@ upstreamed to codefzer, cherry-picked cleanly. Framework: pytest, like the rest
 of the suite. Sections are added per backport step (B, C, D, E).
 """
 
+import pytest
+
 import sru
+import targets
 
 
 # --- Step B / #2: bnf 'bib' CQL context set ---------------------------------
@@ -109,3 +112,57 @@ def test_diagnostic_message_details_fallback_and_none():
     assert sru._diagnostic_message(root) == "boom"
     # A normal response with no diagnostics yields None (no error raised).
     assert sru._diagnostic_message({"records": {}}) is None
+
+
+# --- Step E / #1: add_target schema-retrieval validation --------------------
+
+def test_is_schema_diagnostic():
+    assert targets.is_schema_diagnostic("Unknown record schema for retrieval") is True
+    assert targets.is_schema_diagnostic("Unsupported record schema") is True
+    # A non-schema diagnostic (e.g. unsupported scan) must not match, so a real
+    # failure is not mistaken for a wrong-schema signal.
+    assert targets.is_schema_diagnostic("The sru operation is not supported") is False
+    assert targets.is_schema_diagnostic(None) is False
+    assert targets.is_schema_diagnostic("") is False
+
+
+def test_schema_candidates_order_and_dedup():
+    # Guessed first, then advertised, then common fallbacks; duplicates collapse.
+    assert targets.schema_candidates("other", ["mods", "dc"], "marcxml") == \
+        ["marcxml", "mods", "dc", "oai_dc"]
+    # No advertised schemas: guessed, then the fallback set.
+    assert targets.schema_candidates("alma", [], "marcxml") == \
+        ["marcxml", "dc", "oai_dc"]
+    # Falsy entries dropped.
+    assert targets.schema_candidates("other", [None, ""], "") == \
+        ["marcxml", "dc", "oai_dc"]
+
+
+@pytest.mark.asyncio
+async def test_select_validated_schema_confirms_first_working():
+    # The first candidate returns records on its first probe -> confirmed.
+    async def run(schema, query):
+        return {"records": 3 if schema == "marcxml" else 0, "schema_error": False}
+    result = await targets.select_validated_schema(["marcxml", "dc"], run)
+    assert result == ("marcxml", "confirmed")
+
+
+@pytest.mark.asyncio
+async def test_select_validated_schema_skips_schema_error_then_confirms():
+    # marcxml raises a schema diagnostic (skip it); dc then confirms.
+    async def run(schema, query):
+        if schema == "marcxml":
+            return {"records": 0, "schema_error": True}
+        return {"records": 5, "schema_error": False}
+    result = await targets.select_validated_schema(["marcxml", "dc"], run)
+    assert result == ("dc", "confirmed")
+
+
+@pytest.mark.asyncio
+async def test_select_validated_schema_assumes_first_when_inconclusive():
+    # Nothing returns records and nothing is a schema error -> fall back to the
+    # guessed default (first candidate), marked "assumed" so the caller caveats.
+    async def run(schema, query):
+        return {"records": 0, "schema_error": False}
+    result = await targets.select_validated_schema(["marcxml", "dc"], run)
+    assert result == ("marcxml", "assumed")
