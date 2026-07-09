@@ -33,7 +33,7 @@
     "version": "1.2",
     "default_schema": "dublincore",
     "default_index": "bib",
-    "notes": "French national library"
+    "notes": "French national library; uses the 'bib' CQL context set (bib.title, bib.author, bib.anywhere, ...)"
   },
   {
     "id": "dnb",
@@ -55,24 +55,6 @@
     "extra_params": {
       "x-collection": "GGC"
     }
-  },
-  {
-    "id": "bibsys",
-    "name": "BIBSYS",
-    "url": "http://sru.bibsys.no/search/biblio",
-    "version": "1.1",
-    "default_schema": "dc",
-    "default_index": "dc",
-    "notes": "Norwegian academic libraries"
-  },
-  {
-    "id": "trove",
-    "name": "National Library of Australia (Trove)",
-    "url": "https://api.trove.nla.gov.au/v3/sru",
-    "version": "1.1",
-    "default_schema": "dc",
-    "default_index": "dc",
-    "notes": "Australian national library aggregator"
   },
   {
     "id": "pitt",
