@@ -447,6 +447,25 @@ class SRUError(Exception):
     """Raised for protocol-level or connectivity errors."""
 
 
+def _diagnostic_message(root: Any) -> str | None:
+    """Return an SRU diagnostic message from a response root, or None if there
+    are no diagnostics. Namespace-agnostic. Factored out so searchRetrieve and
+    scan surface server diagnostics identically: scan previously swallowed them,
+    so a server that does not support scan showed "No terms found" instead of
+    the real reason (e.g. "Unsupported operation")."""
+    diag = _get_ns(root, "diagnostics")
+    if not diag:
+        return None
+    msg_block = _get_ns(diag, "diagnostic") or diag
+    if isinstance(msg_block, list):
+        msg_block = msg_block[0] if msg_block else {}
+    return (
+        _ns_text(msg_block, "message")
+        or _ns_text(msg_block, "details")
+        or (msg_block if isinstance(msg_block, str) else str(msg_block))
+    )
+
+
 async def explain(
     server_url: str,
     username: str | None = None,
@@ -498,17 +517,9 @@ async def search_retrieve(
     data = await _get_xml(server_url, params, username, password)
     root = _unwrap(_get_ns(data, "searchRetrieveResponse")) or data
 
-    # Surface diagnostic errors from the server (namespace-agnostic)
-    diag = _get_ns(root, "diagnostics")
-    if diag:
-        msg_block = _get_ns(diag, "diagnostic") or diag
-        if isinstance(msg_block, list):
-            msg_block = msg_block[0] if msg_block else {}
-        message = (
-            _ns_text(msg_block, "message")
-            or _ns_text(msg_block, "details")
-            or (msg_block if isinstance(msg_block, str) else str(msg_block))
-        )
+    # Surface diagnostic errors from the server (namespace-agnostic).
+    message = _diagnostic_message(root)
+    if message:
         raise SRUError(f"SRU server diagnostic: {message}")
 
     return root
@@ -532,7 +543,20 @@ async def scan(
     }
     params.update(_server_extra_params(server_url))
     data = await _get_xml(server_url, params, username, password)
-    return _unwrap(_get_ns(data, "scanResponse")) or data
+    # A server that does not support scan may return the diagnostic in a
+    # scanResponse (LoC lx2) OR wrapped in a searchRetrieveResponse envelope
+    # (Alma reports "The sru operation is not supported" that way). Resolve
+    # either, then surface any diagnostic rather than returning an empty term
+    # list, which showed "No terms found" and hid the real reason.
+    root = (
+        _unwrap(_get_ns(data, "scanResponse"))
+        or _unwrap(_get_ns(data, "searchRetrieveResponse"))
+        or data
+    )
+    message = _diagnostic_message(root)
+    if message:
+        raise SRUError(f"SRU server diagnostic: {message}")
+    return root
 
 
 def parse_scan_results(root: dict[str, Any]) -> list[dict[str, Any]]:
@@ -706,6 +730,28 @@ def parse_search_results(root: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Dublin Core element localnames, used to detect an unwrapped DC record whose
+# dc:* elements sit directly under recordData with no <dc> wrapper (KB's jsru
+# endpoint), unlike LoC/DNB which wrap them in <srw_dc:dc>.
+_DC_ELEMENT_NAMES = frozenset({
+    "title", "creator", "subject", "description", "publisher",
+    "contributor", "date", "type", "format", "identifier",
+    "source", "language", "relation", "coverage", "rights",
+})
+
+
+def _has_dublin_core_elements(node: Any) -> bool:
+    """True if node is a dict with any direct child whose localname is a Dublin
+    Core element. Used to catch records that carry dc:* elements directly under
+    recordData with no wrapping <dc> element (KB's unwrapped form)."""
+    if not isinstance(node, dict):
+        return False
+    for k in node:
+        if _localname(k) in _DC_ELEMENT_NAMES:
+            return True
+    return False
+
+
 def _parse_record_data(record_data: dict | str, schema: str) -> dict:
     """Parse a single record's data into a flat dict (namespace-agnostic)."""
     if isinstance(record_data, str):
@@ -725,6 +771,14 @@ def _parse_record_data(record_data: dict | str, schema: str) -> dict:
         marc = marc_raw[0] if isinstance(marc_raw, list) else marc_raw
         if isinstance(marc, dict):
             return _parse_marcxml(marc, schema)
+
+    # Unwrapped Dublin Core: some servers (KB's jsru endpoint) put the dc:*
+    # elements directly under recordData with no <dc> wrapper. Parse recordData
+    # itself as the DC block when its children look like DC elements. Checked
+    # after MARCXML, whose <record> children are never DC localnames, so this
+    # cannot mis-fire on a MARC record.
+    if _has_dublin_core_elements(record_data):
+        return _parse_dublin_core(record_data, schema)
 
     return {"raw": record_data, "schema": schema}
 
