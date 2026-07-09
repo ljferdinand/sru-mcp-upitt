@@ -275,6 +275,79 @@ def build_entry(
 
 
 # ---------------------------------------------------------------------------
+# Retrieval-schema validation
+# ---------------------------------------------------------------------------
+#
+# choose_default_schema picks a plausible record schema, but "advertised in
+# explain" does not guarantee "returns records on retrieval": some endpoints
+# list a schema they then reject with a schema diagnostic, or accept it but
+# return nothing usable. sru_add_target therefore confirms the schema with a
+# tiny test search before baking it into the entry. The decision logic is kept
+# pure here (I/O is injected as a `run` callable) so it unit-tests without httpx;
+# sru.validate_schema_for_retrieval supplies the real network `run`.
+
+# Probe queries for schema validation, tried in order. A bare-term query is
+# included because a few endpoints reject cql.anywhere but accept a plain term.
+SCHEMA_PROBE_QUERIES: list[str] = ["cql.anywhere = book", "book"]
+
+# A diagnostic message mentioning "schema" means the schema is the problem
+# (e.g. "Unknown record schema", "Unsupported record schema for retrieval"),
+# so the next candidate should be tried; any other failure does not condemn the
+# schema (it may be a transient network issue or an unrelated query problem).
+_SCHEMA_DIAGNOSTIC_RE = re.compile(r"schema", re.IGNORECASE)
+
+
+def is_schema_diagnostic(message: str | None) -> bool:
+    """True if an SRU diagnostic message concerns the record schema."""
+    return bool(message) and bool(_SCHEMA_DIAGNOSTIC_RE.search(message))
+
+
+def schema_candidates(
+    platform: str,
+    advertised: list[str] | None,
+    guessed: str | None,
+) -> list[str]:
+    """Ordered, de-duplicated record schemas to probe for retrieval. The guessed
+    default goes first (most likely correct), then the schemas the server
+    advertised in explain, then common fallbacks in case explain under-reported.
+    Empty/None entries are dropped."""
+    ordered: list[str] = []
+    for s in [guessed, *(advertised or []), "marcxml", "dc", "oai_dc"]:
+        if s and s not in ordered:
+            ordered.append(s)
+    return ordered
+
+
+async def select_validated_schema(
+    candidates: list[str],
+    run: Any,
+    queries: list[str] | None = None,
+) -> tuple[str | None, str]:
+    """Pure core of retrieval-schema validation. Try each candidate schema
+    against each probe query using the injected async `run(schema, query)`
+    callable, which returns a dict {"records": int, "schema_error": bool}.
+
+    Returns (schema, status):
+      - ("<schema>", "confirmed") : a probe returned at least one record.
+      - (candidates[0], "assumed"): nothing confirmed; fall back to the guessed
+        default, unvalidated (the caller decides whether to caveat it).
+      - (None, "assumed")         : no candidates at all.
+
+    A schema whose probe raises a schema diagnostic is abandoned immediately and
+    the next candidate is tried; an unrelated failure (or zero records) just
+    moves on to the next query, since it does not prove the schema wrong."""
+    queries = queries or SCHEMA_PROBE_QUERIES
+    for schema in candidates:
+        for q in queries:
+            r = await run(schema, q)
+            if r.get("records"):
+                return schema, "confirmed"
+            if r.get("schema_error"):
+                break  # wrong schema; skip remaining queries, try next candidate
+    return (candidates[0] if candidates else None), "assumed"
+
+
+# ---------------------------------------------------------------------------
 # Persistence  (~/.sru-mcp/user_servers.json)
 # ---------------------------------------------------------------------------
 
