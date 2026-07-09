@@ -305,9 +305,25 @@ _ALMA_FIELD_INDEX: dict[str, str] = {
     "keyword":   "alma.all_for_ui",
 }
 
+# Bibliothèque nationale de France uses the "bib" CQL context set. bnf's
+# default_index is "bib" in servers.json, but without a map here build_cql fell
+# back to dc and emitted cql.anywhere, which BnF rejects ("Index non supporté").
+# Index names verified live via sru_list_indexes on the BnF endpoint 2026-07-09.
+# No default relevance sort key for bib (see _DEFAULT_SORT).
+_BIB_FIELD_INDEX: dict[str, str] = {
+    "title":     "bib.title",
+    "author":    "bib.author",
+    "isbn":      "bib.isbn",
+    "subject":   "bib.subject",
+    "publisher": "bib.publisher",
+    "year":      "bib.date",
+    "keyword":   "bib.anywhere",
+}
+
 _INDEX_SETS: dict[str, dict[str, str]] = {
     "dc": _FIELD_INDEX,
     "alma": _ALMA_FIELD_INDEX,
+    "bib": _BIB_FIELD_INDEX,
 }
 
 
