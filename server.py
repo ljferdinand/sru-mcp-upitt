@@ -161,10 +161,10 @@ async def sru_add_target(
     """Register the SRU endpoint for a library so you can search it like the built-in servers.
 
     Assembles the endpoint URL for the chosen platform, verifies it with an SRU
-    explain probe, and on success saves it to ~/.sru-mcp/user_servers.json and
-    caches its capabilities. On failure nothing is saved, and the reason is
-    reported. Credentials, if supplied, are used only for the probe and are
-    never stored.
+    explain probe, confirms a working record schema with a test search, and on
+    success saves it to ~/.sru-mcp/user_servers.json and caches its
+    capabilities. On failure nothing is saved, and the reason is reported.
+    Credentials, if supplied, are used only for the probe and are never stored.
 
     After adding, use the key with sru_search_books, sru_search, sru_explain,
     sru_list_indexes, etc. The added server works immediately in this session
@@ -224,10 +224,33 @@ async def sru_add_target(
             f"sru_list_platforms to review the required inputs."
         )
 
-    # 4. Probe succeeded: choose the record schema, build the entry, register,
-    #    and cache the capabilities from the explain we just fetched.
+    # 4. Probe succeeded: choose a record schema, then CONFIRM it actually
+    #    returns records with a tiny test search before baking it in. "Advertised
+    #    in explain" does not guarantee "retrievable": some endpoints list a
+    #    schema they then reject on retrieval (seen most with the 'other'
+    #    platform, where there is no templated known-good default). A failed or
+    #    inconclusive probe never blocks the add — a reachable server is still
+    #    worth registering; the caller can set record_schema explicitly.
     advertised = [s.get("name", "") for s in info.get("schemas", []) if s.get("name")]
-    schema = targets.choose_default_schema(platform, advertised)
+    guessed = targets.choose_default_schema(platform, advertised)
+    candidates = targets.schema_candidates(platform, advertised, guessed)
+    validated, status = await sru.validate_schema_for_retrieval(
+        url, candidates, version=platform_version,
+        username=username, password=password,
+    )
+    schema = validated or guessed
+    if status == "confirmed":
+        schema_line = f"- Record schema: {schema} (confirmed by a test search)\n"
+    else:
+        schema_line = f"- Record schema: {schema}\n"
+        # Only caveat for 'other': the templated platforms carry a reliable
+        # default, so an inconclusive probe there is not worth alarming about.
+        if platform == "other":
+            schema_line += (
+                f"  > note: could not confirm a record schema with a test search; "
+                f"using {schema}. If retrieval returns nothing, pass record_schema "
+                f"explicitly to sru_search / sru_search_books.\n"
+            )
     entry = targets.build_entry(resolved_key, name, platform, url, inputs, schema)
     saved, _ = targets.register_user_server(entry)
 
@@ -249,7 +272,7 @@ async def sru_add_target(
         f"**Added `{resolved_key}` — {title}.**\n"
         f"- URL: `{url}`\n"
         f"- Platform: {platform}\n"
-        f"- Record schema: {schema}\n"
+        f"{schema_line}"
         f"- Indexes discovered: {n_indexes}\n"
         f"- Supported schemas: {', '.join(schemas) if schemas else 'none listed'}\n\n"
         f'Try it: `sru_search_books(server="{resolved_key}", keyword="...")`.'
