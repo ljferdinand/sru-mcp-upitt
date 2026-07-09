@@ -499,13 +499,19 @@ async def search_retrieve(
     record_schema: str | None = None,
     username: str | None = None,
     password: str | None = None,
+    version: str | None = None,
 ) -> dict[str, Any]:
-    """Execute an SRU searchRetrieve request and return the parsed response."""
+    """Execute an SRU searchRetrieve request and return the parsed response.
+
+    version: force a specific SRU version for this request (as explain accepts).
+    If omitted, it is resolved from servers.json. sru_add_target passes it
+    explicitly when validating a record schema against a newly-probed endpoint
+    that is not yet in the registry (so it cannot be resolved by URL)."""
     # recordPacking omitted on purpose (see explain): "xml" is the SRU default
     # and sending it 500s the LoC lx2 endpoint.
     params: dict[str, str] = {
         "operation": "searchRetrieve",
-        "version": _server_version(server_url),
+        "version": version or _server_version(server_url),
         "query": cql_query,
         "maximumRecords": str(max_records),
         "startRecord": str(start_record),
@@ -582,6 +588,39 @@ def parse_scan_results(root: dict[str, Any]) -> list[dict[str, Any]]:
                 entry["count"] = count_raw
         results.append(entry)
     return results
+
+
+async def validate_schema_for_retrieval(
+    server_url: str,
+    candidates: list[str],
+    version: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+) -> tuple[str | None, str]:
+    """Confirm which candidate record schema actually returns records from a
+    freshly-probed endpoint, by running tiny test searches. Wraps the pure
+    targets.select_validated_schema with a real network `run`: for each
+    (schema, query) it performs a one-record searchRetrieve and classifies the
+    outcome as records / schema-error / neither.
+
+    Returns (schema, "confirmed") when a probe returned records, or
+    (guessed_default, "assumed") when nothing confirmed. Never raises: a probe
+    failure is reported as inconclusive so sru_add_target can still register the
+    server (many endpoints simply do not expose retrieval the way explain hints,
+    and that should not block adding a reachable server)."""
+    async def run(schema: str, query: str) -> dict[str, Any]:
+        try:
+            root = await search_retrieve(
+                server_url, query, max_records=1, record_schema=schema,
+                username=username, password=password, version=version,
+            )
+        except SRUError as exc:
+            return {"records": 0, "schema_error": targets.is_schema_diagnostic(str(exc))}
+        parsed = parse_search_results(root)
+        count = parsed.get("total") or len(parsed.get("records") or [])
+        return {"records": count, "schema_error": False}
+
+    return await targets.select_validated_schema(candidates, run)
 
 
 # ---------------------------------------------------------------------------
