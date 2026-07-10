@@ -5,13 +5,13 @@ An MCP server that searches library catalogs worldwide using the [SRU (Search/Re
 ## Features
 
 - **10 tools** for LLM-driven bibliographic search
-- **9 pre-configured servers** including the Library of Congress, BnF, DNB, the KB, Trove, and a University of Pittsburgh (Ex Libris Alma) endpoint
-- **Add your own library** with `sru_add_target` — no JSON editing. It builds the endpoint URL for your ILS platform, verifies it with a live probe, and registers it (see [Add your own library](#add-your-own-library) below)
+- **7 pre-configured servers**: the Library of Congress (catalog plus name and subject authorities), the Bibliothèque nationale de France, the Deutsche Nationalbibliothek, the Koninklijke Bibliotheek, and a University of Pittsburgh (Ex Libris Alma) endpoint
+- **Add your own library** with `sru_add_target` — no JSON editing. It builds the endpoint URL for your ILS platform, verifies it with a live probe, confirms a working record schema with a test search, and registers it (see [Add your own library](#add-your-own-library) below)
 - Sends the SRU **version per server** (1.1 / 1.2) from `servers.json`, and omits the optional `recordPacking` parameter (`xml` is the SRU default, and some servers such as the LoC reject it when present)
-- Parses **MARCXML** and **Dublin Core** record formats
+- Parses **MARCXML** and **Dublin Core** record formats, including servers (such as the KB) that return Dublin Core elements unwrapped, directly under `recordData`
 - Supports any SRU-compliant server: pass a URL or use a built-in server ID
 - Raw CQL queries or high-level field-based search (title, author, ISBN, subject, etc.)
-- Per-server index sets, so field search uses the right indexes (e.g. `alma.*` for Alma)
+- Per-server index sets, so field search uses the right indexes (e.g. `alma.*` for Alma, `bib.*` for the BnF)
 
 ## Requirements
 
@@ -144,7 +144,7 @@ Use the path to the interpreter that has the dependencies (the venv's `python` i
 |------|-------------|
 | `sru_list_servers` | List all catalog servers (built-in and user-added) |
 | `sru_list_platforms` | List the ILS platforms `sru_add_target` supports and the inputs each needs |
-| `sru_add_target` | Add your own library's SRU endpoint (builds the URL, probes it, registers it) |
+| `sru_add_target` | Add your own library's SRU endpoint (builds the URL, probes it, confirms a schema, registers it) |
 | `sru_remove_target` | Remove a server you added with `sru_add_target` |
 | `sru_explain` | Get a server's capabilities, supported schemas, and indexes |
 | `sru_list_indexes` | List available search indexes on a server (use to discover index names for CQL) |
@@ -167,6 +167,12 @@ Field-based search against the University of Pittsburgh catalog. Field search au
 sru_search_books(server="pitt", title="Moby Dick", author="Melville")
 ```
 
+Field-based search against the Bibliothèque nationale de France. The BnF uses the `bib` context set, so field search maps to `bib.*` automatically:
+
+```
+sru_search_books(server="bnf", title="les misérables")
+```
+
 Raw CQL, discovering index names first:
 
 ```
@@ -181,7 +187,7 @@ Most people have never met SRU, because it is historically an *institution-to-in
 ### What to expect
 
 - The tool searches and retrieves **bibliographic metadata** (title, author, subject, ISBN, and so on) and returns catalog **records** in MARCXML or Dublin Core. It does not retrieve full text.
-- Indexes and record schemas **vary per institution**, which is why the server discovers them (via the explain probe) rather than assuming.
+- Indexes and record schemas **vary per institution**, which is why the server discovers them (via the explain probe) rather than assuming. It also runs a small **test search** to confirm the record schema actually returns records before saving it.
 - Some catalogs require **authentication** the tool does not manage, and **many institutions do not expose SRU publicly at all**. A failed add usually means "that endpoint is not open," not "the tool is broken."
 
 ### Finding your endpoint
@@ -190,7 +196,7 @@ Run `sru_list_platforms` to see what each platform needs. Then call `sru_add_tar
 
 - **Alma** (Ex Libris): supply your **Alma domain** and **institution code**. The domain is the host in your browser's address bar when you are logged into Alma (for example `pitt.alma.exlibrisgroup.com`, or a datacenter form like `eu03.alma.exlibrisgroup.com`). The institution code looks like `01PITT_INST` and lives in Alma's configuration, or a systems librarian can tell you. Note that **SRU is off by default in Alma** and must be enabled institution-side; if the probe fails, that is the first thing to check.
 - **Koha / FOLIO**: supply the **host** (and for FOLIO the tenant **dbname**); the port and database default to the usual values (`9999`/`biblios` for Koha, `9997` for FOLIO) and can be overridden. These endpoints are frequently internal-only or an optional add-on, so a public probe may not answer. Your systems administrator has these details.
-- **Other / any SRU server**: if you already have a working SRU **base URL** from anywhere, use the `other` platform and pass it directly. The record schema is chosen from what the server advertises in its explain response.
+- **Other / any SRU server**: if you already have a working SRU **base URL** from anywhere, use the `other` platform and pass it directly. The record schema is chosen from what the server advertises in its explain response and then confirmed with a quick test search; if none can be confirmed, the best guess is used and the report says so.
 
 ### Example
 
@@ -210,11 +216,9 @@ The added server is written to `~/.sru-mcp/user_servers.json`, works immediately
 | `loc` | Library of Congress | 1.1 | dc | US national catalog |
 | `loc-names` | LC Name Authority | 1.1 | dc | Personal and corporate names (same host as `loc`) |
 | `loc-subjects` | LC Subject Authority | 1.1 | dc | Subject headings and genre terms (same host as `loc`) |
-| `bnf` | Bibliothèque nationale de France | 1.2 | dublincore | French national library |
+| `bnf` | Bibliothèque nationale de France | 1.2 | dublincore | French national library; uses the `bib` CQL context set |
 | `dnb` | Deutsche Nationalbibliothek | 1.1 | oai_dc | German national library |
-| `kb` | Koninklijke Bibliotheek | 1.1 | dc | Netherlands national library; GGC catalog via `x-collection=GGC` |
-| `bibsys` | BIBSYS | 1.1 | dc | Norwegian academic libraries |
-| `trove` | National Library of Australia (Trove) | 1.1 | dc | Australian national library aggregator |
+| `kb` | Koninklijke Bibliotheek | 1.1 | dc | Netherlands national library; GGC catalog via `x-collection=GGC`; returns unwrapped Dublin Core |
 | `pitt` | University of Pittsburgh | 1.2 | marcxml | ULS, Ex Libris Alma; institution code `01PITT_INST`; uses the `alma` CQL index set |
 
 ### Adding a server
@@ -224,7 +228,7 @@ Two ways. For most users, `sru_add_target` (above) is the easiest and needs no f
 - `id`, `name`, `url`, `notes`
 - `version`: the SRU version the endpoint expects (`1.1` or `1.2`). The client sends this per request.
 - `default_schema`: the record schema label for the server.
-- `default_index`: the CQL index set the field-based search should use (`dc` by default, `alma` for Ex Libris Alma).
+- `default_index`: the CQL index set the field-based search should use (`dc` by default, `alma` for Ex Libris Alma, `bib` for the BnF).
 - `extra_params` (optional): an object of extra query parameters appended to every request, for endpoints that need them (for example, the KB requires `{"x-collection": "GGC"}`).
 
 Servers you add with `sru_add_target` are stored separately in `~/.sru-mcp/user_servers.json` (not the repo). Resolution precedence is **`servers.json` > `user_servers.json` > discovered profile > built-in default**, so a shipped server always wins and a user entry can never shadow it.
@@ -235,6 +239,7 @@ Servers you add with `sru_add_target` are stored separately in `~/.sru-mcp/user_
 
 - `dc` (default): `dc.title`, `dc.creator`, `dc.subject`, `dc.publisher`, `dc.date`, `bath.isbn`, `cql.anywhere`.
 - `alma` (Ex Libris Alma, e.g. `pitt`): `alma.title`, `alma.creator`, `alma.isbn`, `alma.subjects`, `alma.publisher`, `alma.main_pub_date`, `alma.all_for_ui`.
+- `bib` (BnF, e.g. `bnf`): `bib.title`, `bib.author`, `bib.isbn`, `bib.subject`, `bib.publisher`, `bib.date`, `bib.anywhere`. The BnF rejects `cql.anywhere` ("Index non supporté"), so keyword search maps to `bib.anywhere`.
 
 For servers using any other index set, or to build precise queries, use `sru_search` with raw CQL, and run `sru_list_indexes` first to discover the index names.
 
@@ -277,15 +282,25 @@ defaults. The cache tolerates a missing or corrupt file by starting fresh.
 
 ## Record schemas
 
-The requested schema defaults to each server's `default_schema` from `servers.json` (resolved per server), not a single hardcoded value: LoC and several others use `dc`, DNB uses `oai_dc`, and Alma uses `marcxml`. Requesting a schema the server does not support yields a `requestedRecordSchema` diagnostic, so passing `record_schema` explicitly is only needed to request a non-default schema the server also supports. Use `sru_explain` to see the supported schemas.
+The requested schema defaults to each server's `default_schema` from `servers.json` (resolved per server), not a single hardcoded value: LoC and several others use `dc`, DNB uses `oai_dc`, and Alma uses `marcxml`. Requesting a schema the server does not support yields a `requestedRecordSchema` diagnostic, so passing `record_schema` explicitly is only needed to request a non-default schema the server also supports. Use `sru_explain` to see the supported schemas. When you register a server with `sru_add_target`, the tool confirms a working schema with a test search before saving it, so a newly added catalog starts with a schema that actually returns records.
 
 ## Notes and limitations
 
 - **Protocol version and record packing:** the version is sent per server from the `version` field (1.1 or 1.2). The client omits `recordPacking` entirely; `xml` is the SRU default, and the LoC `lx2` endpoints return HTTP 500 when `recordPacking` is present. SRU 1.2-only servers such as Alma return empty result sets if queried with 1.1, so keep each server's `version` accurate.
 - **Response parsing is namespace-agnostic:** explain, searchRetrieve, and scan responses are parsed by element localname regardless of the namespace prefix a server uses (`zs:`, `srw:`, a prefix on the explain payload, or the SRW namespace as the default with no prefix). A lone `<record>` wrapped in a list by `force_list` is also handled. Earlier versions matched only specific prefixes, which made `sru_explain`/`sru_list_indexes` silently return "Unknown / 0 indexes" on real servers.
+- **Unwrapped Dublin Core:** some servers (the KB) return DC records as `dc:*` elements directly under `recordData`, with no wrapping `<dc>` element. The parser detects this shape and extracts the fields, so those records show real titles instead of blanks.
+- **Scan support varies:** some catalogs (the LoC `lx2` endpoints and Ex Libris Alma) do not implement the SRU scan operation. `sru_scan` surfaces the server's diagnostic (for example "Unsupported operation") instead of silently returning an empty term list, so it is clear the server, not the query, is the reason.
 - **Alma record cap:** Alma rejects `maximumRecords` above 50, so `sru_search_books` caps it at 50 for `alma` servers.
 - **Index sets:** field-based `sru_search_books` only matches when the server's `default_index` map fits the server. For anything unusual, use `sru_search` with the server's own indexes.
 - **Koninklijke Bibliotheek:** uses `http://jsru.kb.nl/sru/sru` with `x-collection=GGC` to target the GGC catalog. The older `jsru.kb.nl/sru` path is retired.
+
+## Troubleshooting
+
+- **`sru_add_target` probe fails and nothing is saved.** This is usually the endpoint, not the tool: many institutions never expose SRU publicly, and for Alma it is off by default and must be enabled institution-side. Recheck the Alma domain and institution code, and confirm SRU is turned on.
+- **A search returns zero results, or an "Index non supporté" / diagnostic error.** The field-to-index map may not fit the server. Field search uses the server's `default_index` set (`dc`, `alma`, or `bib`); if the catalog uses different indexes, run `sru_list_indexes` to find the real names and query with `sru_search` and raw CQL. The BnF needs the `bib` set, which is built in for `bnf`.
+- **`sru_scan` returns a diagnostic instead of terms.** That catalog does not implement the scan operation (common on the LoC `lx2` endpoints and Alma). This is expected; use `sru_search` instead.
+- **Records show up blank or as "[No title]".** Older versions failed to parse Dublin Core whose elements were not wrapped in a `<dc>` element (the KB does this); that is fixed. If you still see blanks, the server may be returning a schema the parser does not map, so try `sru_search` with an explicit `record_schema` (see `sru_explain` for the supported list).
+- **The MCP server hangs or stops responding in Claude Desktop.** Fully quit Claude Desktop (tray icon, Quit) and reopen so the server subprocess restarts; closing the window is not enough.
 
 ## Development
 
@@ -294,7 +309,7 @@ The requested schema defaults to each server's `default_schema` from `servers.js
 pip install pytest pytest-asyncio respx
 
 # Run tests
-python3 -m pytest test_sru.py test_server.py -v
+python3 -m pytest test_sru.py test_server.py test_backport.py -v
 python3 test_targets.py          # identity-discovery core (pure, no network deps)
 
 # Syntax check
@@ -310,10 +325,12 @@ npx @modelcontextprotocol/inspector python server.py
 server.py          FastMCP server — registers the tools
 sru.py             SRU protocol client — HTTP, CQL builder, parsing, formatting, capability cache
 targets.py         Identity-discovery: platform templates, URL assembly, user_servers persistence
+_version.py        Single source of the package version (read by hatchling and importable at runtime)
 servers.json       Built-in server registry (loaded at import time)
 test_sru.py        Tests for sru.py
 test_server.py     Tests for server.py
 test_targets.py    Tests for targets.py (pure, offline)
+test_backport.py   Regression tests for the 0.3.2 backport fixes (#1, #2, #3, #6)
 ```
 
 At runtime the server also reads and writes `~/.sru-mcp/` (outside the repo): `user_servers.json` for servers you add, and `explain_cache.json` for discovered capabilities.
